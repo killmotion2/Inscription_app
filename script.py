@@ -1,0 +1,461 @@
+import streamlit as st
+import sqlite3
+import pandas as pd
+import re
+import base64
+from pathlib import Path
+from contextlib import contextmanager
+
+# =====================================================
+# CONFIGURATION GÉNÉRALE
+# =====================================================
+
+APP_TITLE = "Inscription – Compétition 1RM Bench Press & Pull-up"
+DB_PATH = "app.db"
+MAX_PARTICIPANTS = 20
+
+BG_PATH = "assets/affiche_competition.jpg"
+
+# ===================== AJOUT (ADMIN) =====================
+# Mot de passe admin (priorité: Streamlit secrets, sinon variable par défaut vide)
+try:
+    ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
+except Exception:
+    ADMIN_PASSWORD = ""
+
+if "is_admin" not in st.session_state:
+    st.session_state.is_admin = False
+# =========================================================
+
+# =====================================================
+# PAGE CONFIG
+# =====================================================
+
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="🏋️",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
+
+# =====================================================
+# BACKGROUND GLOBAL + OVERLAY (PALE + LISIBLE)
+# =====================================================
+
+def _guess_mime(path: str) -> str:
+    return "image/png" if path.lower().endswith(".png") else "image/jpeg"
+
+def load_image_as_base64(path: str) -> str:
+    return base64.b64encode(Path(path).read_bytes()).decode("utf-8")
+
+def inject_background_css(bg_path: str) -> None:
+    if not Path(bg_path).exists():
+        st.warning(
+            f"Image de fond introuvable : `{bg_path}`\n"
+            "Crée le dossier `assets/` et ajoute l’affiche."
+        )
+        return
+
+    mime = _guess_mime(bg_path)
+    bg_b64 = load_image_as_base64(bg_path)
+
+    css = f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@500;600;700;800;900&display=swap');
+
+    html, body, [class*="stApp"] {{
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    }}
+
+    /* BACKGROUND GLOBAL */
+    .stApp {{
+      background-image: url("data:{mime};base64,{bg_b64}");
+      background-repeat: no-repeat;
+      background-position: top center;
+      background-size: 100% auto;
+      background-attachment: scroll;
+      min-height: 100vh;
+      position: relative;
+    }}
+
+    /* VOILE GLOBAL POUR PÂLIR L'AFFICHE */
+    .stApp::before {{
+      content: "";
+      position: fixed;
+      inset: 0;
+      background: rgba(255, 255, 255, 0.92);
+      z-index: 0;
+      pointer-events: none;
+    }}
+
+    /* Supprimer fond blanc Streamlit */
+    [data-testid="stAppViewContainer"] {{
+      background: transparent;
+    }}
+
+    /* Container principal */
+    .block-container {{
+      max-width: 760px;
+      padding-top: 1.25rem;
+      padding-bottom: 2rem;
+      position: relative;
+      z-index: 1;
+    }}
+
+    /* =================================================
+       ÉCRITEAUX FLOTTANTS – OMBRE TRÈS ACCENTUÉE
+       ================================================= */
+
+    .overlay-card {{
+      background: rgba(255, 255, 255, 0.97);
+      border-radius: 22px;
+      padding: 26px;
+      margin-bottom: 26px;
+
+      /* OMBRES MULTI-COUCHES (effet profondeur forte) */
+      box-shadow:
+        0 2px 6px rgba(0, 0, 0, 0.12),
+        0 12px 20px rgba(0, 0, 0, 0.22),
+        0 28px 50px rgba(0, 0, 0, 0.35),
+        0 60px 90px rgba(0, 0, 0, 0.25);
+
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+    }}
+
+    /* =================================================
+       TEXTE – CONTRASTE MAX
+       ================================================= */
+
+    .stApp {{
+      color: #0b1220;
+      font-size: 17.5px;
+      font-weight: 700;
+      line-height: 1.6;
+    }}
+
+    p, li, label {{
+      color: #0b1220 !important;
+      font-weight: 700 !important;
+      letter-spacing: 0.15px;
+      text-rendering: geometricPrecision;
+    }}
+
+    h1 {{
+      font-size: 2.1rem !important;
+      font-weight: 900 !important;
+      text-shadow:
+        0 1px 2px rgba(0,0,0,0.25),
+        0 4px 8px rgba(0,0,0,0.25);
+    }}
+
+    h2 {{
+      font-size: 1.6rem !important;
+      font-weight: 900 !important;
+      text-shadow:
+        0 1px 2px rgba(0,0,0,0.20),
+        0 3px 6px rgba(0,0,0,0.25);
+    }}
+
+    h3 {{
+      font-size: 1.3rem !important;
+      font-weight: 800 !important;
+      text-shadow:
+        0 1px 2px rgba(0,0,0,0.20),
+        0 3px 6px rgba(0,0,0,0.25);
+    }}
+
+    /* Boutons */
+    .stButton > button {{
+      width: 100%;
+      height: 48px;
+      border-radius: 12px;
+      border: 2px solid #0077ee;
+      color: #0077ee;
+      font-weight: 900;
+      background: #ffffff;
+      box-shadow:
+        0 4px 10px rgba(0,0,0,0.15),
+        0 10px 24px rgba(0,0,0,0.20);
+    }}
+
+    /* Inputs */
+    .stTextInput input {{
+      height: 48px;
+      border-radius: 12px;
+      background: #ffffff;
+      font-weight: 800;
+      color: #0b1220;
+      box-shadow:
+        inset 0 2px 4px rgba(0,0,0,0.15);
+    }}
+
+    
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+
+inject_background_css(BG_PATH)
+
+# =====================================================
+# BASE DE DONNÉES
+# =====================================================
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS inscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nom_complet TEXT NOT NULL,
+    numero_membre TEXT NOT NULL UNIQUE,
+    frais_compris INTEGER NOT NULL,
+    date_inscription TEXT DEFAULT (datetime('now'))
+);
+"""
+
+@contextmanager
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def init_db():
+    with db_connect() as conn:
+        conn.executescript(SCHEMA)
+        conn.commit()
+
+def count_registrations():
+    with db_connect() as conn:
+        return conn.execute("SELECT COUNT(*) FROM inscriptions").fetchone()[0]
+
+def insert_registration(nom_complet, numero_membre, frais_compris):
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO inscriptions (nom_complet, numero_membre, frais_compris)
+                VALUES (?, ?, ?)
+                """,
+                (nom_complet, numero_membre, int(frais_compris)),
+            )
+            conn.commit()
+        return True, None
+    except sqlite3.IntegrityError:
+        return False, "Ce numéro de membre est déjà inscrit."
+    except Exception:
+        return False, "Erreur lors de l'inscription."
+
+def get_registrations_df():
+    with db_connect() as conn:
+        return pd.read_sql(
+            """
+            SELECT
+                nom_complet AS "Nom complet",
+                numero_membre AS "Numéro de membre",
+                frais_compris AS "Frais compris",
+                date_inscription AS "Date d'inscription"
+            FROM inscriptions
+            ORDER BY date_inscription DESC
+            """,
+            conn,
+        )
+
+# ===================== AJOUT (DELETE) =====================
+def delete_registration_by_member(numero_membre: str):
+    with db_connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM inscriptions WHERE numero_membre = ?",
+            (numero_membre,),
+        )
+        conn.commit()
+        return cur.rowcount
+# =========================================================
+
+init_db()
+
+# =====================================================
+# VALIDATIONS
+# =====================================================
+
+def validate_full_name(name):
+    return ["Nom complet invalide."] if not name or len(name.strip()) < 3 else []
+
+def validate_member_number(number):
+    if not number:
+        return ["Numéro de membre requis."]
+    if not re.fullmatch(r"[A-Za-z0-9\\- ]{3,30}", number.strip()):
+        return ["Format du numéro de membre invalide."]
+    return []
+
+def validate_fee_ack(ack):
+    return [] if ack else ["Tu dois confirmer que les frais sont compris."]
+
+# ===================== AJOUT (UI ADMIN) =====================
+# Connexion admin (sidebar) — visible, mais la suppression n’apparaît que si authentifié
+with st.sidebar:
+    st.markdown("### Admin")
+    if st.session_state.is_admin:
+        st.success("Mode admin activé")
+        if st.button("Se déconnecter", use_container_width=True):
+            st.session_state.is_admin = False
+            st.rerun()
+    else:
+        admin_pass = st.text_input("Mot de passe", type="password")
+        if st.button("Connexion", use_container_width=True):
+            if ADMIN_PASSWORD and admin_pass == ADMIN_PASSWORD:
+                st.session_state.is_admin = True
+                st.rerun()
+            else:
+                st.error("Mot de passe invalide.")
+# =========================================================
+
+# =====================================================
+# UI
+# =====================================================
+
+st.title("🏋️ Inscription – Compétition 1RM")
+st.caption("Bench Press & Pull-up · Inscription publique")
+
+tabs = st.tabs(["Accueil", "Inscription"])
+
+# ------------------ ACCUEIL ---------------------------
+with tabs[0]:
+    #st.markdown('<div class="overlay-card">', unsafe_allow_html=True)
+
+    st.subheader("Accueil")
+    st.write("Bienvenue! Inscris-toi dès maintenant à la compétition.")
+
+    total = count_registrations()
+    st.info(f"Inscriptions : **{total} / {MAX_PARTICIPANTS}**")
+
+    with st.expander("Participants"):
+        df = get_registrations_df()
+        if df.empty:
+            st.write("Aucune inscription.")
+        else:
+            st.download_button(
+                "Télécharger les inscriptions",
+                df.to_csv(index=False).encode("utf-8"),
+                "inscriptions.csv",
+                "text/csv",
+            )
+            df_affichage = df.drop(columns=["Frais compris"], errors="ignore")
+            st.dataframe(df_affichage, use_container_width=True)
+
+        # ===================== AJOUT (SUPPRESSION ADMIN) =====================
+        if st.session_state.is_admin:
+            st.markdown("---")
+            st.markdown("### Supprimer un participant (Admin seulement)")
+
+            if df.empty:
+                st.info("Aucun participant à supprimer.")
+            else:
+                # choix par numéro de membre (unique)
+                options = df["Numéro de membre"].astype(str).tolist()
+                membre_cible = st.selectbox("Sélectionner le numéro de membre", options)
+
+                confirm = st.checkbox("Je confirme vouloir supprimer ce participant définitivement.")
+                if st.button("🗑️ Supprimer", use_container_width=True, disabled=not confirm):
+                    nb = delete_registration_by_member(membre_cible)
+                    if nb > 0:
+                        st.success(f"Participant supprimé : {membre_cible}")
+                        st.rerun()
+                    else:
+                        st.warning("Aucune suppression effectuée (participant introuvable).")
+        # ===============================================================
+
+        # 1) Informations générales
+    st.markdown("## Informations générales")
+    st.markdown("- **Date**: 21 mars 2026, 13h00")
+    st.markdown("- **Prix**: 37.5 $ +tx")
+    st.markdown(
+        '**Pour toutes autres questions** : communiquer le Nautilus Plus Laval, '
+        '<a href="tel:+14506682686" style="font-weight:700; color:#0077ee; text-decoration:none;">'
+        '+1 450-668-2686</a>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown("---")
+
+    # 2) Règlements
+    st.markdown("## Règlements de la compétition")
+    st.markdown("- **Échauffement**: 30 minutes avant le début")
+    st.markdown("- **Tentatives**: 3 tentatives par épreuve 1RM")
+    st.markdown(
+        "- **Équipement autorisé**: Ceinture de levage, protège-poignets, chaussures de levage, craie de magnésium")
+    st.markdown("- **Jugement**: Respect strict des critères de technique")
+    st.markdown("- **Disqualification**: Faux mouvement ou non-respect des règles")
+    st.markdown("- **Résultats**: Classement par poids corporel, par catégorie et par âge")
+
+    st.markdown("---")
+
+    # 3) Critères de réussite
+    st.markdown("## Critères de réussite des mouvements")
+
+    st.markdown("### BENCH PRESS")
+    st.markdown("**Commandes de l’arbitre** (respectées durant l’essai) :")
+    st.markdown(
+        '- **"Start"** : lorsque les bras sont en extension et que la barre est stabilisée, l’arbitre annonce cette commande pour débuter le mouvement.')
+    st.markdown("- La barre touche le torse durant le mouvement. Aucune pause sur le torse n’est obligatoire.")
+    st.markdown(
+        '- **"Rack"** : lorsque les bras sont en extension et que la barre est stabilisée, l’arbitre annonce cette commande pour déposer la barre sur les supports / barres de sécurité.')
+
+    st.markdown(
+        "- Les talons, les fessiers et le haut du torse restent en contact avec le banc en tout temps durant le mouvement.")
+
+
+    st.markdown("### PULL-UP")
+
+    st.markdown("**Commande de l’arbitre** (respectée durant l’essai) :")
+    st.markdown("- L'athlète doit avoir les bras complètement en extension avant de débuter le mouvement.")
+    st.markdown("- L'athlète commence lorsqu'il le souhaite")
+    st.markdown(
+        '- **"Down"** : lorsque le menton est au-dessus de la barre et que le mouvement est stable, l’arbitre annonce cette commande pour déplier les bras.')
+    st.markdown('- Aucun élan n’est permis (**aucun "kipping"**).')
+
+    st.markdown("---")
+    #st.markdown("</div>", unsafe_allow_html=True)
+
+# ---------------- INSCRIPTION -------------------------
+with tabs[1]:
+    #st.markdown('<div class="overlay-card">', unsafe_allow_html=True)
+
+    st.subheader("Inscription")
+
+    remaining = MAX_PARTICIPANTS - count_registrations()
+    if remaining <= 0:
+        st.error("⛔ Inscriptions complètes.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.stop()
+
+    st.caption(f"Places restantes : {remaining}")
+
+    with st.form("registration_form", clear_on_submit=True):
+        nom_complet = st.text_input("Nom complet")
+        numero_membre = st.text_input("Numéro de membre")
+        frais_compris = st.checkbox("Je confirme que les frais d’inscription sont compris")
+        submit = st.form_submit_button("Soumettre")
+
+    if submit:
+        errors = (
+            validate_full_name(nom_complet)
+            + validate_member_number(numero_membre)
+            + validate_fee_ack(frais_compris)
+        )
+
+        if count_registrations() >= MAX_PARTICIPANTS:
+            errors.append("Les inscriptions sont maintenant complètes.")
+
+        if errors:
+            st.error("Veuillez corriger les erreurs suivantes :")
+            for e in errors:
+                st.write(f"- {e}")
+        else:
+            ok, err = insert_registration(nom_complet.strip(), numero_membre.strip(), frais_compris)
+            if ok:
+                st.success("✅ Inscription confirmée! Merci 👊")
+                st.balloons()
+            else:
+                st.error(err)
+
+    #st.markdown("</div>", unsafe_allow_html=True)
