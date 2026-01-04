@@ -283,8 +283,9 @@ def validate_full_name(name):
 def validate_member_number(number):
     if not number:
         return ["Numéro de membre requis."]
-    if not re.fullmatch(r"[A-Za-z0-9\\- ]{3,30}", number.strip()):
+    if not re.fullmatch(r"[A-Za-z0-9 -]{3,30}", number):
         return ["Format du numéro de membre invalide."]
+
     return []
 
 def validate_fee_ack(ack):
@@ -459,3 +460,4 @@ with tabs[1]:
                 st.error(err)
 
     #st.markdown("</div>", unsafe_allow_html=True)
+
