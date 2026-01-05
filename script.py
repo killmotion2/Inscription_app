@@ -5,19 +5,24 @@ import re
 import base64
 from pathlib import Path
 from contextlib import contextmanager
+from datetime import datetime
+
+# ====== AJOUT (Google Sheets persistant) ======
+import gspread
+from google.oauth2.service_account import Credentials
+# =============================================
 
 # =====================================================
 # CONFIGURATION GÉNÉRALE
 # =====================================================
 
 APP_TITLE = "Inscription – Compétition 1RM Bench Press & Pull-up"
-DB_PATH = "app.db"
+DB_PATH = "app.db"  # fallback local seulement
 MAX_PARTICIPANTS = 20
 
 BG_PATH = "assets/affiche_competition.jpg"
 
 # ===================== AJOUT (ADMIN) =====================
-# Mot de passe admin (priorité: Streamlit secrets, sinon variable par défaut vide)
 try:
     ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
 except Exception:
@@ -26,6 +31,18 @@ except Exception:
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
 # =========================================================
+
+# ===================== AJOUT (CONFIG SHEETS) =====================
+# Si GSHEET_ID + gcp_service_account existent -> mode persistant Google Sheets
+GSHEET_ID = ""
+try:
+    GSHEET_ID = st.secrets.get("GSHEET_ID", "")
+except Exception:
+    GSHEET_ID = ""
+
+SHEET_TAB_NAME = "inscriptions"  # nom de l’onglet dans le Google Sheet
+SHEET_HEADERS = ["nom_complet", "numero_membre", "frais_compris", "date_inscription"]
+# ================================================================
 
 # =====================================================
 # PAGE CONFIG
@@ -67,7 +84,6 @@ def inject_background_css(bg_path: str) -> None:
       font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
     }}
 
-    /* BACKGROUND GLOBAL */
     .stApp {{
       background-image: url("data:{mime};base64,{bg_b64}");
       background-repeat: no-repeat;
@@ -78,7 +94,6 @@ def inject_background_css(bg_path: str) -> None:
       position: relative;
     }}
 
-    /* VOILE GLOBAL POUR PÂLIR L'AFFICHE */
     .stApp::before {{
       content: "";
       position: fixed;
@@ -88,12 +103,10 @@ def inject_background_css(bg_path: str) -> None:
       pointer-events: none;
     }}
 
-    /* Supprimer fond blanc Streamlit */
     [data-testid="stAppViewContainer"] {{
       background: transparent;
     }}
 
-    /* Container principal */
     .block-container {{
       max-width: 760px;
       padding-top: 1.25rem;
@@ -102,30 +115,19 @@ def inject_background_css(bg_path: str) -> None:
       z-index: 1;
     }}
 
-    /* =================================================
-       ÉCRITEAUX FLOTTANTS – OMBRE TRÈS ACCENTUÉE
-       ================================================= */
-
     .overlay-card {{
       background: rgba(255, 255, 255, 0.97);
       border-radius: 22px;
       padding: 26px;
       margin-bottom: 26px;
-
-      /* OMBRES MULTI-COUCHES (effet profondeur forte) */
       box-shadow:
         0 2px 6px rgba(0, 0, 0, 0.12),
         0 12px 20px rgba(0, 0, 0, 0.22),
         0 28px 50px rgba(0, 0, 0, 0.35),
         0 60px 90px rgba(0, 0, 0, 0.25);
-
       backdrop-filter: blur(14px);
       -webkit-backdrop-filter: blur(14px);
     }}
-
-    /* =================================================
-       TEXTE – CONTRASTE MAX
-       ================================================= */
 
     .stApp {{
       color: #0b1220;
@@ -165,7 +167,6 @@ def inject_background_css(bg_path: str) -> None:
         0 3px 6px rgba(0,0,0,0.25);
     }}
 
-    /* Boutons */
     .stButton > button {{
       width: 100%;
       height: 48px;
@@ -179,7 +180,6 @@ def inject_background_css(bg_path: str) -> None:
         0 10px 24px rgba(0,0,0,0.20);
     }}
 
-    /* Inputs */
     .stTextInput input {{
       height: 48px;
       border-radius: 12px;
@@ -189,8 +189,6 @@ def inject_background_css(bg_path: str) -> None:
       box-shadow:
         inset 0 2px 4px rgba(0,0,0,0.15);
     }}
-
-    
     </style>
     """
     st.markdown(css, unsafe_allow_html=True)
@@ -198,8 +196,47 @@ def inject_background_css(bg_path: str) -> None:
 inject_background_css(BG_PATH)
 
 # =====================================================
-# BASE DE DONNÉES
+# STOCKAGE PERSISTANT (GOOGLE SHEETS) + FALLBACK SQLITE
 # =====================================================
+
+def using_gsheets() -> bool:
+    return bool(GSHEET_ID) and ("gcp_service_account" in st.secrets)
+
+@st.cache_resource
+def _get_gspread_client():
+    creds_info = dict(st.secrets["gcp_service_account"])
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+    return gspread.authorize(creds)
+
+def _get_sheet():
+    client = _get_gspread_client()
+    sh = client.open_by_key(GSHEET_ID)
+    try:
+        ws = sh.worksheet(SHEET_TAB_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=SHEET_TAB_NAME, rows=1000, cols=20)
+    return ws
+
+def init_storage():
+    """Assure que la 'table' existe (headers)."""
+    if using_gsheets():
+        ws = _get_sheet()
+        values = ws.get_all_values()
+        if not values:
+            ws.append_row(SHEET_HEADERS)
+        else:
+            # si le header n'est pas bon, on le force
+            if [c.strip() for c in values[0]] != SHEET_HEADERS:
+                ws.delete_rows(1)
+                ws.insert_row(SHEET_HEADERS, 1)
+    else:
+        init_db_sqlite()
+
+# -------------------- SQLITE (fallback) --------------------
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS inscriptions (
@@ -219,16 +256,56 @@ def db_connect():
     finally:
         conn.close()
 
-def init_db():
+def init_db_sqlite():
     with db_connect() as conn:
         conn.executescript(SCHEMA)
         conn.commit()
 
+# -------------------- API stockage (abstrait) --------------------
+
 def count_registrations():
+    if using_gsheets():
+        ws = _get_sheet()
+        # -1 pour l'entête
+        n = max(len(ws.get_all_values()) - 1, 0)
+        return n
     with db_connect() as conn:
         return conn.execute("SELECT COUNT(*) FROM inscriptions").fetchone()[0]
 
+def _gsheets_df_raw() -> pd.DataFrame:
+    ws = _get_sheet()
+    values = ws.get_all_values()
+    if len(values) <= 1:
+        return pd.DataFrame(columns=SHEET_HEADERS)
+    header = values[0]
+    rows = values[1:]
+    df = pd.DataFrame(rows, columns=header)
+
+    # normalise types
+    if "frais_compris" in df.columns:
+        df["frais_compris"] = df["frais_compris"].astype(str).str.strip().replace({"True": "1", "False": "0"})
+    return df
+
 def insert_registration(nom_complet, numero_membre, frais_compris):
+    if using_gsheets():
+        try:
+            ws = _get_sheet()
+            df = _gsheets_df_raw()
+            # unicité
+            if not df.empty and (df["numero_membre"].astype(str).str.strip() == str(numero_membre).strip()).any():
+                return False, "Ce numéro de membre est déjà inscrit."
+
+            ws.append_row([
+                str(nom_complet).strip(),
+                str(numero_membre).strip(),
+                str(int(bool(frais_compris))),
+                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            ])
+            return True, None
+        except Exception:
+            return False, "Erreur lors de l'inscription."
+
+    # fallback sqlite
     try:
         with db_connect() as conn:
             conn.execute(
@@ -246,6 +323,31 @@ def insert_registration(nom_complet, numero_membre, frais_compris):
         return False, "Erreur lors de l'inscription."
 
 def get_registrations_df():
+    if using_gsheets():
+        df = _gsheets_df_raw()
+        if df.empty:
+            return pd.DataFrame(columns=["Nom complet", "Numéro de membre", "Frais compris", "Date d'inscription"])
+
+        # tri desc par date si possible
+        if "date_inscription" in df.columns:
+            df["_date_sort"] = pd.to_datetime(df["date_inscription"], errors="coerce")
+            df = df.sort_values("_date_sort", ascending=False).drop(columns=["_date_sort"], errors="ignore")
+
+        # colonnes FR pour affichage/export
+        out = df.rename(columns={
+            "nom_complet": "Nom complet",
+            "numero_membre": "Numéro de membre",
+            "frais_compris": "Frais compris",
+            "date_inscription": "Date d'inscription",
+        })
+
+        # garde l’ordre
+        for c in ["Nom complet", "Numéro de membre", "Frais compris", "Date d'inscription"]:
+            if c not in out.columns:
+                out[c] = ""
+        return out[["Nom complet", "Numéro de membre", "Frais compris", "Date d'inscription"]]
+
+    # sqlite
     with db_connect() as conn:
         return pd.read_sql(
             """
@@ -260,8 +362,27 @@ def get_registrations_df():
             conn,
         )
 
-# ===================== AJOUT (DELETE) =====================
 def delete_registration_by_member(numero_membre: str):
+    if using_gsheets():
+        ws = _get_sheet()
+        values = ws.get_all_values()
+        if len(values) <= 1:
+            return 0
+
+        # Trouver les lignes à supprimer (exact match sur numero_membre)
+        # Sheet rows are 1-indexed; values includes header at row 1
+        target = str(numero_membre).strip()
+        rows_to_delete = []
+        for idx, row in enumerate(values[1:], start=2):
+            if len(row) >= 2 and str(row[1]).strip() == target:
+                rows_to_delete.append(idx)
+
+        # supprimer en partant de la fin pour garder les index valides
+        for r in reversed(rows_to_delete):
+            ws.delete_rows(r)
+
+        return len(rows_to_delete)
+
     with db_connect() as conn:
         cur = conn.execute(
             "DELETE FROM inscriptions WHERE numero_membre = ?",
@@ -269,9 +390,9 @@ def delete_registration_by_member(numero_membre: str):
         )
         conn.commit()
         return cur.rowcount
-# =========================================================
 
-init_db()
+# init stockage au démarrage
+init_storage()
 
 # =====================================================
 # VALIDATIONS
@@ -288,12 +409,10 @@ def validate_member_number(number):
         return ["Format du numéro de membre invalide."]
     return []
 
-
 def validate_fee_ack(ack):
     return [] if ack else ["Tu dois confirmer que les frais sont compris."]
 
-# ===================== AJOUT (UI ADMIN) =====================
-# Connexion admin (sidebar) — visible, mais la suppression n’apparaît que si authentifié
+# ===================== UI ADMIN (sidebar) =====================
 with st.sidebar:
     st.markdown("### Admin")
     if st.session_state.is_admin:
@@ -309,7 +428,7 @@ with st.sidebar:
                 st.rerun()
             else:
                 st.error("Mot de passe invalide.")
-# =========================================================
+# =====================================================
 
 # =====================================================
 # UI
@@ -322,8 +441,6 @@ tabs = st.tabs(["Accueil", "Inscription"])
 
 # ------------------ ACCUEIL ---------------------------
 with tabs[0]:
-    #st.markdown('<div class="overlay-card">', unsafe_allow_html=True)
-
     st.subheader("Accueil")
     st.write("Bienvenue! Inscris-toi dès maintenant à la compétition.")
 
@@ -344,7 +461,6 @@ with tabs[0]:
             df_affichage = df.drop(columns=["Frais compris"], errors="ignore")
             st.dataframe(df_affichage, use_container_width=True)
 
-        # ===================== AJOUT (SUPPRESSION ADMIN) =====================
         if st.session_state.is_admin:
             st.markdown("---")
             st.markdown("### Supprimer un participant (Admin seulement)")
@@ -352,7 +468,6 @@ with tabs[0]:
             if df.empty:
                 st.info("Aucun participant à supprimer.")
             else:
-                # choix par numéro de membre (unique)
                 options = df["Numéro de membre"].astype(str).tolist()
                 membre_cible = st.selectbox("Sélectionner le numéro de membre", options)
 
@@ -364,9 +479,7 @@ with tabs[0]:
                         st.rerun()
                     else:
                         st.warning("Aucune suppression effectuée (participant introuvable).")
-        # ===============================================================
 
-        # 1) Informations générales
     st.markdown("## Informations générales")
     st.markdown("- **Date**: 21 mars 2026, 13h00")
     st.markdown("- **Prix**: 37.5 $ +tx")
@@ -379,55 +492,39 @@ with tabs[0]:
 
     st.markdown("---")
 
-    # 2) Règlements
     st.markdown("## Règlements de la compétition")
     st.markdown("- **Échauffement**: 30 minutes avant le début")
     st.markdown("- **Tentatives**: 3 tentatives par épreuve 1RM")
-    st.markdown(
-        "- **Équipement autorisé**: Ceinture de levage, protège-poignets, chaussures de levage, craie de magnésium")
+    st.markdown("- **Équipement autorisé**: Ceinture de levage, protège-poignets, chaussures de levage, craie de magnésium")
     st.markdown("- **Jugement**: Respect strict des critères de technique")
     st.markdown("- **Disqualification**: Faux mouvement ou non-respect des règles")
     st.markdown("- **Résultats**: Classement par poids corporel, par catégorie et par âge")
 
     st.markdown("---")
 
-    # 3) Critères de réussite
     st.markdown("## Critères de réussite des mouvements")
 
     st.markdown("### BENCH PRESS")
     st.markdown("**Commandes de l’arbitre** (respectées durant l’essai) :")
-    st.markdown(
-        '- **"Start"** : lorsque les bras sont en extension et que la barre est stabilisée, l’arbitre annonce cette commande pour débuter le mouvement.')
+    st.markdown('- **"Start"** : lorsque les bras sont en extension et que la barre est stabilisée, l’arbitre annonce cette commande pour débuter le mouvement.')
     st.markdown("- La barre touche le torse durant le mouvement. Aucune pause sur le torse n’est obligatoire.")
-    st.markdown(
-        '- **"Rack"** : lorsque les bras sont en extension et que la barre est stabilisée, l’arbitre annonce cette commande pour déposer la barre sur les supports / barres de sécurité.')
-
-    st.markdown(
-        "- Les talons, les fessiers et le haut du torse restent en contact avec le banc en tout temps durant le mouvement.")
-
+    st.markdown('- **"Rack"** : lorsque les bras sont en extension et que la barre est stabilisée, l’arbitre annonce cette commande pour déposer la barre sur les supports / barres de sécurité.')
+    st.markdown("- Les talons, les fessiers et le haut du torse restent en contact avec le banc en tout temps durant le mouvement.")
 
     st.markdown("### PULL-UP")
-
     st.markdown("**Commande de l’arbitre** (respectée durant l’essai) :")
     st.markdown("- L'athlète doit avoir les bras complètement en extension avant de débuter le mouvement.")
     st.markdown("- L'athlète commence lorsqu'il le souhaite")
-    st.markdown(
-        '- **"Down"** : lorsque le menton est au-dessus de la barre et que le mouvement est stable, l’arbitre annonce cette commande pour déplier les bras.')
+    st.markdown('- **"Down"** : lorsque le menton est au-dessus de la barre et que le mouvement est stable, l’arbitre annonce cette commande pour déplier les bras.')
     st.markdown('- Aucun élan n’est permis (**aucun "kipping"**).')
-
-    st.markdown("---")
-    #st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------- INSCRIPTION -------------------------
 with tabs[1]:
-    #st.markdown('<div class="overlay-card">', unsafe_allow_html=True)
-
     st.subheader("Inscription")
 
     remaining = MAX_PARTICIPANTS - count_registrations()
     if remaining <= 0:
         st.error("⛔ Inscriptions complètes.")
-        st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
 
     st.caption(f"Places restantes : {remaining}")
@@ -459,7 +556,3 @@ with tabs[1]:
                 st.balloons()
             else:
                 st.error(err)
-
-    #st.markdown("</div>", unsafe_allow_html=True)
-
-
