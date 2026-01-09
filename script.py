@@ -5,12 +5,10 @@ import re
 import base64
 from pathlib import Path
 from contextlib import contextmanager
-from datetime import datetime
 
-# ====== AJOUT (Google Sheets persistant) ======
-import gspread
-from google.oauth2.service_account import Credentials
-# =============================================
+# ===== AJOUT (Supabase Postgres) =====
+import psycopg2
+# ====================================
 
 # =====================================================
 # CONFIGURATION GÉNÉRALE
@@ -22,7 +20,7 @@ MAX_PARTICIPANTS = 20
 
 BG_PATH = "assets/affiche_competition.jpg"
 
-# ===================== AJOUT (ADMIN) =====================
+# ===================== ADMIN =====================
 try:
     ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
 except Exception:
@@ -30,19 +28,14 @@ except Exception:
 
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
-# =========================================================
+# ================================================
 
-# ===================== AJOUT (CONFIG SHEETS) =====================
-# Si GSHEET_ID + gcp_service_account existent -> mode persistant Google Sheets
-GSHEET_ID = ""
+# ===================== AJOUT (DATABASE_URL) =====================
 try:
-    GSHEET_ID = st.secrets.get("GSHEET_ID", "")
+    DATABASE_URL = st.secrets.get("DATABASE_URL", "")
 except Exception:
-    GSHEET_ID = ""
-
-SHEET_TAB_NAME = "inscriptions"  # nom de l’onglet dans le Google Sheet
-SHEET_HEADERS = ["nom_complet", "numero_membre", "frais_compris", "date_inscription"]
-# ================================================================
+    DATABASE_URL = ""
+# ===============================================================
 
 # =====================================================
 # PAGE CONFIG
@@ -196,49 +189,13 @@ def inject_background_css(bg_path: str) -> None:
 inject_background_css(BG_PATH)
 
 # =====================================================
-# STOCKAGE PERSISTANT (GOOGLE SHEETS) + FALLBACK SQLITE
+# STOCKAGE PERSISTANT (SUPABASE POSTGRES) + FALLBACK SQLITE
 # =====================================================
 
-def using_gsheets() -> bool:
-    return bool(GSHEET_ID) and ("gcp_service_account" in st.secrets)
+def using_postgres() -> bool:
+    return bool(DATABASE_URL and DATABASE_URL.strip())
 
-@st.cache_resource
-def _get_gspread_client():
-    creds_info = dict(st.secrets["gcp_service_account"])
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-    return gspread.authorize(creds)
-
-def _get_sheet():
-    client = _get_gspread_client()
-    sh = client.open_by_key(GSHEET_ID)
-    try:
-        ws = sh.worksheet(SHEET_TAB_NAME)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=SHEET_TAB_NAME, rows=1000, cols=20)
-    return ws
-
-def init_storage():
-    """Assure que la 'table' existe (headers)."""
-    if using_gsheets():
-        ws = _get_sheet()
-        values = ws.get_all_values()
-        if not values:
-            ws.append_row(SHEET_HEADERS)
-        else:
-            # si le header n'est pas bon, on le force
-            if [c.strip() for c in values[0]] != SHEET_HEADERS:
-                ws.delete_rows(1)
-                ws.insert_row(SHEET_HEADERS, 1)
-    else:
-        init_db_sqlite()
-
-# -------------------- SQLITE (fallback) --------------------
-
-SCHEMA = """
+SCHEMA_SQLITE = """
 CREATE TABLE IF NOT EXISTS inscriptions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     nom_complet TEXT NOT NULL,
@@ -248,107 +205,101 @@ CREATE TABLE IF NOT EXISTS inscriptions (
 );
 """
 
+SCHEMA_POSTGRES = """
+CREATE TABLE IF NOT EXISTS inscriptions (
+    id BIGSERIAL PRIMARY KEY,
+    nom_complet TEXT NOT NULL,
+    numero_membre TEXT NOT NULL UNIQUE,
+    frais_compris BOOLEAN NOT NULL,
+    date_inscription TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
 @contextmanager
 def db_connect():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    try:
-        yield conn
-    finally:
-        conn.close()
+    """
+    Streamlit Cloud (Supabase): Postgres via DATABASE_URL
+    Local (sans secret): SQLite via DB_PATH
+    """
+    if using_postgres():
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            yield conn
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        try:
+            yield conn
+        finally:
+            conn.close()
 
-def init_db_sqlite():
+def init_db():
     with db_connect() as conn:
-        conn.executescript(SCHEMA)
-        conn.commit()
-
-# -------------------- API stockage (abstrait) --------------------
+        if using_postgres():
+            cur = conn.cursor()
+            cur.execute(SCHEMA_POSTGRES)
+            conn.commit()
+            cur.close()
+        else:
+            conn.executescript(SCHEMA_SQLITE)
+            conn.commit()
 
 def count_registrations():
-    if using_gsheets():
-        ws = _get_sheet()
-        # -1 pour l'entête
-        n = max(len(ws.get_all_values()) - 1, 0)
-        return n
     with db_connect() as conn:
-        return conn.execute("SELECT COUNT(*) FROM inscriptions").fetchone()[0]
-
-def _gsheets_df_raw() -> pd.DataFrame:
-    ws = _get_sheet()
-    values = ws.get_all_values()
-    if len(values) <= 1:
-        return pd.DataFrame(columns=SHEET_HEADERS)
-    header = values[0]
-    rows = values[1:]
-    df = pd.DataFrame(rows, columns=header)
-
-    # normalise types
-    if "frais_compris" in df.columns:
-        df["frais_compris"] = df["frais_compris"].astype(str).str.strip().replace({"True": "1", "False": "0"})
-    return df
+        if using_postgres():
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM inscriptions;")
+            n = int(cur.fetchone()[0])
+            cur.close()
+            return n
+        return int(conn.execute("SELECT COUNT(*) FROM inscriptions").fetchone()[0])
 
 def insert_registration(nom_complet, numero_membre, frais_compris):
-    if using_gsheets():
-        try:
-            ws = _get_sheet()
-            df = _gsheets_df_raw()
-            # unicité
-            if not df.empty and (df["numero_membre"].astype(str).str.strip() == str(numero_membre).strip()).any():
-                return False, "Ce numéro de membre est déjà inscrit."
-
-            ws.append_row([
-                str(nom_complet).strip(),
-                str(numero_membre).strip(),
-                str(int(bool(frais_compris))),
-                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            ])
-            return True, None
-        except Exception:
-            return False, "Erreur lors de l'inscription."
-
-    # fallback sqlite
     try:
         with db_connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO inscriptions (nom_complet, numero_membre, frais_compris)
-                VALUES (?, ?, ?)
-                """,
-                (nom_complet, numero_membre, int(frais_compris)),
-            )
-            conn.commit()
+            if using_postgres():
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO inscriptions (nom_complet, numero_membre, frais_compris)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (nom_complet, numero_membre, bool(frais_compris)),
+                )
+                conn.commit()
+                cur.close()
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO inscriptions (nom_complet, numero_membre, frais_compris)
+                    VALUES (?, ?, ?)
+                    """,
+                    (nom_complet, numero_membre, int(frais_compris)),
+                )
+                conn.commit()
         return True, None
-    except sqlite3.IntegrityError:
-        return False, "Ce numéro de membre est déjà inscrit."
-    except Exception:
+    except Exception as e:
+        msg = str(e).lower()
+        if "unique" in msg or "duplicate" in msg:
+            return False, "Ce numéro de membre est déjà inscrit."
         return False, "Erreur lors de l'inscription."
 
 def get_registrations_df():
-    if using_gsheets():
-        df = _gsheets_df_raw()
-        if df.empty:
-            return pd.DataFrame(columns=["Nom complet", "Numéro de membre", "Frais compris", "Date d'inscription"])
-
-        # tri desc par date si possible
-        if "date_inscription" in df.columns:
-            df["_date_sort"] = pd.to_datetime(df["date_inscription"], errors="coerce")
-            df = df.sort_values("_date_sort", ascending=False).drop(columns=["_date_sort"], errors="ignore")
-
-        # colonnes FR pour affichage/export
-        out = df.rename(columns={
-            "nom_complet": "Nom complet",
-            "numero_membre": "Numéro de membre",
-            "frais_compris": "Frais compris",
-            "date_inscription": "Date d'inscription",
-        })
-
-        # garde l’ordre
-        for c in ["Nom complet", "Numéro de membre", "Frais compris", "Date d'inscription"]:
-            if c not in out.columns:
-                out[c] = ""
-        return out[["Nom complet", "Numéro de membre", "Frais compris", "Date d'inscription"]]
-
-    # sqlite
     with db_connect() as conn:
+        if using_postgres():
+            return pd.read_sql(
+                """
+                SELECT
+                    nom_complet AS "Nom complet",
+                    numero_membre AS "Numéro de membre",
+                    frais_compris AS "Frais compris",
+                    date_inscription AS "Date d'inscription"
+                FROM inscriptions
+                ORDER BY date_inscription DESC
+                """,
+                conn,
+            )
         return pd.read_sql(
             """
             SELECT
@@ -363,36 +314,24 @@ def get_registrations_df():
         )
 
 def delete_registration_by_member(numero_membre: str):
-    if using_gsheets():
-        ws = _get_sheet()
-        values = ws.get_all_values()
-        if len(values) <= 1:
-            return 0
-
-        # Trouver les lignes à supprimer (exact match sur numero_membre)
-        # Sheet rows are 1-indexed; values includes header at row 1
-        target = str(numero_membre).strip()
-        rows_to_delete = []
-        for idx, row in enumerate(values[1:], start=2):
-            if len(row) >= 2 and str(row[1]).strip() == target:
-                rows_to_delete.append(idx)
-
-        # supprimer en partant de la fin pour garder les index valides
-        for r in reversed(rows_to_delete):
-            ws.delete_rows(r)
-
-        return len(rows_to_delete)
-
     with db_connect() as conn:
+        if using_postgres():
+            cur = conn.cursor()
+            cur.execute("DELETE FROM inscriptions WHERE numero_membre = %s", (numero_membre,))
+            deleted = int(cur.rowcount)
+            conn.commit()
+            cur.close()
+            return deleted
+
         cur = conn.execute(
             "DELETE FROM inscriptions WHERE numero_membre = ?",
             (numero_membre,),
         )
         conn.commit()
-        return cur.rowcount
+        return int(cur.rowcount)
 
 # init stockage au démarrage
-init_storage()
+init_db()
 
 # =====================================================
 # VALIDATIONS
