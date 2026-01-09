@@ -428,7 +428,7 @@ with tabs[0]:
         '+1 450-668-2686</a>',
         unsafe_allow_html=True
     )
-    st.markdown("Organisateur de l'événement: Xavier Richard, Msc. Kinésiologie")
+    st.markdown("**Organisateur de l'événement**: Xavier Richard, Msc. Kinésiologie")
 
     st.markdown("---")
 
@@ -496,4 +496,5 @@ with tabs[1]:
                 st.balloons()
             else:
                 st.error(err)
+
 
